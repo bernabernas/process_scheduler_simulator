@@ -1,0 +1,23 @@
+# Excluded project folders
+scheduler/
+
+# Compiled Binaries (Executable files)
+# For Linux/macOS (no extension)
+scheduler_bin
+a.out
+*.out
+
+# Object files and Libraries
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dll
+*.dylib
+
+# IDE/Editor configurations 
+.vscode/
+.idea/
+*.swp
+

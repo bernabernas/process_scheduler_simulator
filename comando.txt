@@ -1,0 +1,8 @@
+gcc scheduler.c -o scheduler \
+-I/opt/homebrew/include \
+-L/opt/homebrew/lib \
+-lraylib \
+-framework OpenGL \
+-framework Cocoa \
+-framework IOKit \
+-framework CoreVideo

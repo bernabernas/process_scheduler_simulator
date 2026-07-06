@@ -57,9 +57,8 @@ int current_process = -1;
 static int rrIndex = -1;
 SchedulerType scheduler = FIFO;
 float rr_timer = 0;
+float edf_timer = 0;
 AppState current_state = STATE_MENU;
-float cts_slice = 1.0f;
-float cts_timer = 0;
 
 // Context switch overhead (RR, EDF, MOB)
 float context_switch_time = 0.3f;
@@ -85,6 +84,7 @@ int ganttCount = 0;
 // HUD feedback
 char status_message[64] = { 0 };
 float status_message_timer = 0;
+bool algorithm_chosen = false;  // user must press 1-5 before simulation ticks
 
 // ============================================================
 //  Process defaults
@@ -137,9 +137,9 @@ bool SaveConfig() {
     if (!f) return false;
 
     // header line: counts + global floats
-    fprintf(f, "%d %.3f %.3f %.3f %.3f %.3f %.3f %.3f %.3f\n",
+    fprintf(f, "%d %.3f %.3f %.3f %.3f %.3f %.3f %.3f\n",
             process_count, time_slice, context_switch_time,
-            w1, w2, w3, w4, w5, cts_slice);
+            w1, w2, w3, w4, w5);
 
     for (int i = 0; i < process_count; i++) {
         fprintf(f, "%.3f %.3f %.3f %.3f\n",
@@ -157,19 +157,21 @@ bool LoadConfig() {
     if (!f) return false;
 
     int pc;
-    float ts, cst, lw1, lw2, lw3, lw4, lw5, lcts;
-    if (fscanf(f, "%d %f %f %f %f %f %f %f %f",
-               &pc, &ts, &cst, &lw1, &lw2, &lw3, &lw4, &lw5, &lcts) != 9
+    float ts, cst, lw1, lw2, lw3, lw4, lw5;
+    // SaveConfig writes exactly 8 fields on the header line.
+    // Read exactly 8 — no more, no less — so the file pointer lands
+    // at the start of the per-process rows, not one field ahead.
+    if (fscanf(f, "%d %f %f %f %f %f %f %f",
+               &pc, &ts, &cst, &lw1, &lw2, &lw3, &lw4, &lw5) != 8
         || pc < 1 || pc > MAX_PROCESSES) {
         fclose(f);
         return false;
     }
 
-    process_count      = pc;
-    time_slice         = ts;
-    context_switch_time= fmaxf(0.0f, cst);
+    process_count       = pc;
+    time_slice          = ts;
+    context_switch_time = fmaxf(0.0f, cst);
     w1 = lw1; w2 = lw2; w3 = lw3; w4 = lw4; w5 = lw5;
-    cts_slice          = lcts;
 
     for (int i = 0; i < process_count; i++) {
         float a, b, d, p;
@@ -208,7 +210,8 @@ bool LoadConfig() {
 void StartSimulation() {
     current_time   = 0;
     current_process= -1;
-    rr_timer = cts_timer = 0;
+    rr_timer = 0;
+    edf_timer = 0;
     ganttCount = 0;
     rrIndex = -1;
     in_context_switch = false;
@@ -223,6 +226,7 @@ void StartSimulation() {
         processes[i].completion_time = 0;
     }
 
+    algorithm_chosen = false;
     SaveConfig();
     current_state = STATE_RUNNING;
 }
@@ -388,7 +392,7 @@ void UpdateScheduler(float dt) {
             in_context_switch = false;
 
             if (scheduler == RR)  rr_timer  = 0;
-            if (scheduler == CTS) cts_timer = 0;
+            if (scheduler == EDF) edf_timer = 0;
         }
         return;
     }
@@ -421,30 +425,62 @@ void UpdateScheduler(float dt) {
             if (candidate != -1) { switching = true; switchTarget = candidate; }
         }
     }
-    // ---- EDF ----
+    // ---- EDF com quantum (EDF + RR) ----
+    // Dois gatilhos independentes disparam CS overhead:
+    //   1. Quantum expirou  → re-seleciona por deadline e paga overhead (como RR).
+    //   2. Chegou processo com deadline mais urgente → preempta com overhead.
+    // Conclusao natural do processo nunca paga overhead (current_process == -1).
     else if (scheduler == EDF) {
-        bool arrivalEvent = false;
-        for (int i = 0; i < process_count; i++) {
-            if (processes[i].arrival_time > old_time &&
-                processes[i].arrival_time <= current_time) {
-                arrivalEvent = true; break;
-            }
-        }
+        edf_timer += dt;
+
+        int candidate = SelectEDF();
 
         if (current_process == -1) {
-            current_process = SelectEDF();
-        } else if (arrivalEvent) {
-            int candidate = SelectEDF();
+            // CPU ociosa: seleciona direto, sem overhead.
+            current_process = candidate;
+            edf_timer = 0;
+        } else if (candidate != -1 && candidate != current_process) {
+            // Preempcao por deadline: processo mais urgente chegou.
+            switching    = true;
+            switchTarget = candidate;
+            edf_timer    = 0;
+        } else if (edf_timer >= time_slice) {
+            // Quantum expirou: CS obrigatorio como no RR, vencedor e o de menor deadline.
+            edf_timer = 0;
             if (candidate != -1) { switching = true; switchTarget = candidate; }
         }
     }
     // ---- CTS (Completely Fair) ----
+    // Preemptivo: reavalia todo frame. Qualquer processo que chegue com vruntime
+    // menor que o atual deve preemptar imediatamente — exatamente como o CFS real.
+    // Não usa context-switch overhead (troca é "gratuita" como no kernel).
     else if (scheduler == CTS) {
-        cts_timer += dt;
-        if (current_process == -1 || cts_timer >= cts_slice) {
-            current_process = SelectCTS();
-            cts_timer = 0;
+        int candidate = SelectCTS();
+
+        if (current_process == -1) {
+            // CPU estava ociosa: seleciona diretamente, sem overhead.
+            current_process = candidate;
+        } else if (candidate != -1 && candidate != current_process) {
+            // Preempção: credita o processo ANTERIOR pelo trabalho deste frame
+            // antes de trocar — corrige o bug de atribuição de vruntime.
+            processes[previous_process].vruntime       += dt;
+            processes[previous_process].remaining_time -= dt;
+
+            if (processes[previous_process].remaining_time <= 0) {
+                // Terminou exatamente na preempção: registra conclusão e sai.
+                processes[previous_process].remaining_time  = 0;
+                processes[previous_process].finished        = true;
+                processes[previous_process].completion_time = current_time;
+                current_process = -1;
+                LogGanttSlice(old_time, current_time, previous_process);
+                return;
+            }
+
+            LogGanttSlice(old_time, current_time, previous_process);
+            current_process = candidate;   // troca instantânea, sem overhead
+            return;
         }
+        // Mesmo processo continua: cai no bloco de execução normal abaixo.
     }
     // ---- MOB (Multi-Objective) ----
     else if (scheduler == MOB) {
@@ -666,7 +702,7 @@ void DrawProcesses() {
             float tat = processes[i].completion_time - processes[i].arrival_time;
             float wt  = tat - processes[i].burst_time;
             Color color;
-            if(processes[i].completion_time > processes[i].deadline) color = RED;
+            if(tat > processes[i].deadline - processes[i].arrival_time) color = RED;
             else color = GREEN;
             DrawText(TextFormat("Arr:%.1f Rem:%.1f D:%.1f | TAT:%.1f WT:%.1f  DONE@%.1fs",
                      processes[i].arrival_time, processes[i].remaining_time,
@@ -799,14 +835,14 @@ int main() {
         if (status_message_timer > 0) status_message_timer -= GetFrameTime();
 
         if (current_state == STATE_RUNNING) {
-            if (IsKeyPressed(KEY_ONE))   scheduler = FIFO;
-            if (IsKeyPressed(KEY_TWO))   scheduler = RR;
-            if (IsKeyPressed(KEY_THREE)) scheduler = EDF;
-            if (IsKeyPressed(KEY_FOUR))  scheduler = CTS;
-            if (IsKeyPressed(KEY_FIVE))  scheduler = MOB;
+            if (IsKeyPressed(KEY_ONE))   { scheduler = FIFO; algorithm_chosen = true; }
+            if (IsKeyPressed(KEY_TWO))   { scheduler = RR;   algorithm_chosen = true; }
+            if (IsKeyPressed(KEY_THREE)) { scheduler = EDF;  algorithm_chosen = true; }
+            if (IsKeyPressed(KEY_FOUR))  { scheduler = CTS;  algorithm_chosen = true; }
+            if (IsKeyPressed(KEY_FIVE))  { scheduler = MOB;  algorithm_chosen = true; }
             if (IsKeyPressed(KEY_ESCAPE)) current_state = STATE_MENU;
 
-            UpdateScheduler(GetFrameTime());
+            if (algorithm_chosen) UpdateScheduler(GetFrameTime());
         }
 
         BeginDrawing();
@@ -828,7 +864,10 @@ int main() {
             if (scheduler == RR)
                 DrawText(TextFormat("Q:%.1fs  Slice:%.1fs  CS:%.2fs",
                          time_slice, rr_timer, context_switch_time), 430, 33, 13, RAYWHITE);
-            else if (scheduler == EDF || scheduler == MOB)
+            else if (scheduler == EDF)
+                DrawText(TextFormat("Q:%.1fs  Slice:%.1fs  CS:%.2fs",
+                         time_slice, edf_timer, context_switch_time), 430, 33, 13, RAYWHITE);
+            else if (scheduler == MOB)
                 DrawText(TextFormat("CS overhead: %.2fs", context_switch_time), 430, 33, 13, RAYWHITE);
 
             DrawText(TextFormat("Clock: %.2fs", current_time), 680, 13, 15, GREEN);
@@ -839,6 +878,27 @@ int main() {
             DrawAverageStats();
 
             if (scheduler == MOB) DrawMOBLegend();
+
+            if (!algorithm_chosen) {
+                // Pulsing prompt overlay
+                float pulse = sinf(GetTime() * 3.0f) * 0.4f + 0.6f;
+                DrawRectangle(0, 0, 800, 640, ColorAlpha((Color){10,10,15,255}, 0.82f));
+                DrawText("Choose a scheduling algorithm to start:",
+                         170, 240, 20, LIGHTGRAY);
+                DrawRectangle(190, 278, 420, 170, (Color){30,30,38,255});
+                DrawRectangleLinesEx((Rectangle){190,278,420,170}, 1,
+                                     ColorAlpha(GRAY, pulse));
+                const char* opts[] = {
+                    "  1   FIFO   —  First-In First-Out",
+                    "  2   RR    —  Round Robin",
+                    "  3   EDF   —  Earliest Deadline First",
+                    "  4   CTS   —  Completely Fair",
+                    "  5   MOB   —  Multi-Objective"
+                };
+                for (int k = 0; k < 5; k++)
+                    DrawText(opts[k], 210, 290 + k * 30, 17,
+                             ColorAlpha(YELLOW, pulse));
+            }
 
             if (AllProcessesFinished())
                 DrawText("** Simulation Finished **",

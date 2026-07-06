@@ -174,7 +174,7 @@ These settings are automatically loaded on the next execution.
 
 ```
 .
-├── main.c
+├── scheduler.c
 ├── scheduler_config.txt
 └── README.md
 ```
@@ -184,7 +184,7 @@ These settings are automatically loaded on the next execution.
 Example using GCC:
 
 ```bash
-gcc main.c -o scheduler \
+gcc scheduler.c -o scheduler \
     -lraylib \
     -lopengl32 \
     -lgdi32 \
@@ -194,7 +194,7 @@ gcc main.c -o scheduler \
 For Linux:
 
 ```bash
-gcc main.c -o scheduler \
+gcc scheduler.c -o scheduler \
     -lraylib \
     -lm \
     -lpthread \
